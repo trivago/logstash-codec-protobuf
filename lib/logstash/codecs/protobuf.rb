@@ -16,18 +16,72 @@ class LogStash::Codecs::Protobuf < LogStash::Codecs::Base
   # valid method names are:  encoder_strategy_1 (the others are not implemented yet)
   config :encoder_method, :validate => :string, :default => "encoder_strategy_1"
 
+  # Whether to treat data to decode as complete serialized protobuf objects or
+  # as a stream of serialized protobuf bytes with each protobuf object
+  # prefixed with a varint length
+  config :streaming, :validate => :boolean, :default => false
+
   def register
     @pb_metainfo = {}
     include_path.each { |path| require_pb_path(path) }
     @obj = create_object_from_name(class_name)
     @logger.debug("Protobuf files successfully loaded.")
 
+    if @streaming
+      @logger.debug("Activating streaming mode.")
+      @buffer = ProtocolBuffers.bin_sio("", mode="w+")
+      @proto_length = -1
+    end
   end
 
   def decode(data)
-    decoded = @obj.parse(data.to_s)
-    results = keys2strings(decoded.to_hash)
-    yield LogStash::Event.new(results) if block_given?
+    # If we are streaming, attempt to find a valid varint
+    if @streaming
+      # Add this new piece of information to the end of the buffer
+      @buffer.pos = @buffer.size
+      @buffer.write(data)
+
+      # Rewind to beginning to start decoding attempt
+      @buffer.rewind
+
+      # While buffer contains all bytes as needed to read the current protobuf
+      while @proto_length <= (@buffer.size - @buffer.pos)
+        if @proto_length < 0
+          # If we don't know the size of the probotuf, we need to find it!
+          begin
+            @proto_length = get_protobuf_length
+            if @logger.debug?
+              @logger.debug("Found expected length of next protobuf: #{@proto_length}")
+            end
+          rescue NotEnoughData
+            # Go out of while and wait for another piece of data
+            break
+          rescue ProtocolBuffers::DecodeError => e
+            # If we have enough data but decoding failed, propagate this up to
+            # the logstash input to trigger a reconnection if possible as we
+            # can't sanely recover on codec side alone.
+            @logger.error("Invalid varint detected. Propagating exception to input")
+            raise e
+          end
+
+          # If we got this far, we set a non-negative value for expected length
+          # so lets retry this while loop
+        else
+          # If we know the size of the protobuf, get its bytes and decode it!
+          proto_data = ''
+          @buffer.read(@proto_length, proto_data)
+          # Reset expected length to -1 since we need to read another varint
+          @proto_length = -1
+          yield decode_protobuf(proto_data) if block_given?
+        end
+      end
+
+      # After processing everything we could, remove everything from the buffer
+      # that we no longer need (everything between 0 and @buffer.pos)
+      compact_buffer
+    else
+      yield decode_protobuf(data) if block_given?
+    end
   end # def decode
 
   def keys2strings(data)
@@ -40,14 +94,53 @@ class LogStash::Codecs::Protobuf < LogStash::Codecs::Base
     end
   end
 
-
   def encode(event)
     protobytes = generate_protobuf(event)
     @on_event.call(event, protobytes)
   end # def encode
 
   private
-  def generate_protobuf(event)  
+  def decode_protobuf(proto_data)
+    proto_data = proto_data.to_s
+    if @logger.debug?
+      @logger.debug("Decoding protobuf of length #{proto_data.size}")
+    end
+    decoded = @obj.parse(proto_data)
+    results = keys2strings(decoded.to_hash)
+    LogStash::Event.new(results)
+  end
+
+  def compact_buffer
+    if @buffer.pos > 0
+      if @logger.debug?
+        @logger.debug("Truncating #{@buffer.pos} bytes from beginning of buffer")
+      end
+      remaining = ''
+      @buffer.read(nil, remaining)
+      @buffer = ProtocolBuffers.bin_sio(remaining, mode="a+")
+    end
+  end
+
+  def get_protobuf_length
+    starting_pos = @buffer.pos
+    begin
+      return ProtocolBuffers::Varint.decode(@buffer)
+    rescue => e
+      # If we weren't able to find a varint with the available data, reset
+      # buffer position to the place we started at.
+      @buffer.pos = starting_pos
+      case e
+        when ProtocolBuffers::DecodeError
+          raise e
+        else
+          raise NotEnoughData
+      end
+    end
+  end
+
+  class NotEnoughData < StandardError; end
+
+  def generate_protobuf(event)
     meth = self.method(encoder_method)
     data = meth.call(event, @class_name)
     begin
