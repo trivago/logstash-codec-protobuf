@@ -16,6 +16,8 @@ include_path  (required): an array of strings with filenames or directory names 
 
 class_name    (required): the name of the protobuf class that is to be decoded or encoded.
 
+streaming     (optional): if true, input is assumed to be delimited serialized protobuf messages (each serialized message prefixed with its size in varint format). This is necessary for use with streaming Logstash inputs such as the TCP input.
+
 ## Usage example: decoder
 
 Use this as a codec in any logstash input. Just provide the name of the class that your incoming objects will be encoded in, and specify the path to the compiled definition.
@@ -51,13 +53,46 @@ Make sure to put the referenced Milk class first in the include_path:
 Set the class name to the parent class:
 	
 	class_name => "Foods::Dairy::Cheese"
+	
+### Example with streaming input
+
+Some logstash inputs work in a streaming manner, that is, they take blobs of 
+data without worrying about separation and leave that responsibility to the 
+codec. Such is the case of the default logstash tcp input plugin as can be seen
+[here](https://github.com/logstash-plugins/logstash-input-tcp/blob/e2f124a72ac37cf4cc2259726cc6fea790c602a9/lib/logstash/inputs/tcp.rb#L211).
+
+When using such an input, you can activate the streaming mode of this plugin:
+
+    tcp {
+      port => 5005
+      codec => protobuf {
+        class_name => "Unicorn"
+        include_path => ['/my/path/to/compiled/protobuf/definitions/UnicornProtobuf.pb.rb']
+        streaming => true
+      }
+    }
+  	   
+In streaming mode, this plugin will expect protobufs to arrive prefixed with
+their serialized size encoded in a varint (also known as a delimited protobuf). 
+
+The following is an example implementation of a Java logstash protobuf feeder:
+
+```java
+ByteOutputStream bos = new ByteOutputStream();
+Unicorn unicorn = Unicorn.newBuilder().build();
+unicorn.writeDelimitedTo(byteOutputStream);
+ByteBuffer unicornData = ByteBuffer.wrap(bos.toByteArray());
+SocketChannel tcpChannel = SocketChannel.open(logstashAddress);
+while (unicornData.hasRemaining()) {
+  tcpChannel.send(unicornData);
+}
+```
 
 ## Usage example: encoder
 
 The configuration of the codec for encoding logstash events for a protobuf output is pretty much the same as for the decoder input usage as demonstrated above. There are some constraints though that you need to be aware of:
 * the protobuf definition needs to contain all the fields that logstash typically adds to an event, in the corrent data type. Examples for this are @timestamp (string), @version (string), host, path, all of which depend on your input sources and filters aswell. If you do not want to add those fields to your protobuf definition then please use a [modify filter](https://www.elastic.co/guide/en/logstash/current/plugins-filters-mutate.html) to [remove](https://www.elastic.co/guide/en/logstash/current/plugins-filters-mutate.html#plugins-filters-mutate-remove_field) the undesired fields.
 * object members starting with @ are somewhat problematic in protobuf definitions. Therefore those fields will automatically be renamed to remove the at character. This also effects the important @timestamp field. Please name it just "timestamp" in your definition.
-
 
 ## Troubleshooting
 
